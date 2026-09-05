@@ -2,7 +2,7 @@
   "id": "/",
   "name": "FARMAKEIA",
   "short_name": "FARMAKEIA",
-  "description": "Sistema profissional de gestão de farmácia com controle de estoque FEFO, vendas, caixa e relatórios.",
+  "description": "",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
