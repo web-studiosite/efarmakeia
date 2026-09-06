@@ -1,0 +1,3755 @@
+-- =====================================================================
+-- FARMAKEIA
+-- MIGRAÇÃO DE AUTORIZAÇÃO MULTI-TENANT
+--
+-- MODELO:
+--   SUPER_ADMIN       -> todas as farmácias / administração total
+--   UNIVERSAL_CASHIER -> todas as farmácias / operações de caixa
+--   ADMIN             -> uma ou várias farmácias
+--   JUNIOR_MANAGER    -> uma ou várias farmácias
+--   CASHIER           -> exatamente uma farmácia
+--
+-- NÃO APAGA DADOS DAS TABELAS OPERACIONAIS.
+-- =====================================================================
+
+
+-- =====================================================================
+-- 1. ATUALIZAR ENUM DE ROLES DAS FARMÁCIAS
+-- =====================================================================
+
+DO $$
+BEGIN
+    ALTER TYPE public.user_role_type ADD VALUE IF NOT EXISTS 'JUNIOR_MANAGER';
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
+
+
+-- =====================================================================
+-- 2. CRIAR ROLE DE SISTEMA
+--
+-- system_role NÃO substitui store_users.role.
+--
+-- system_role:
+--   SUPER_ADMIN
+--   UNIVERSAL_CASHIER
+--   USER
+--
+-- store_users.role:
+--   ADMIN
+--   JUNIOR_MANAGER
+--   CASHIER
+-- =====================================================================
+
+DO $$
+BEGIN
+    CREATE TYPE public.system_role_type AS ENUM (
+        'USER',
+        'SUPER_ADMIN',
+        'UNIVERSAL_CASHIER'
+    );
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
+
+
+-- =====================================================================
+-- 3. ADICIONAR system_role AO PERFIL
+-- =====================================================================
+
+ALTER TABLE public.profiles
+ADD COLUMN IF NOT EXISTS system_role public.system_role_type
+DEFAULT 'USER' NOT NULL;
+
+
+-- =====================================================================
+-- 4. MIGRAÇÃO DOS ROLES ANTIGOS
+--
+-- ADMIN antigo -> SUPER_ADMIN
+-- CASHIER antigo -> USER
+--
+-- Isto preserva a interpretação do esquema anterior:
+-- quem era ADMIN global continua tendo acesso administrativo global.
+-- =====================================================================
+
+UPDATE public.profiles
+SET system_role = 'SUPER_ADMIN'
+WHERE role = 'ADMIN'
+  AND system_role = 'USER';
+
+
+-- =====================================================================
+-- 5. GARANTIR QUE O ROLE LOCAL TENHA VALOR VÁLIDO
+-- =====================================================================
+
+UPDATE public.profiles
+SET role = 'CASHIER'
+WHERE role IS NULL;
+
+
+-- =====================================================================
+-- 6. FUNÇÕES CENTRAIS DE AUTORIZAÇÃO
+-- =====================================================================
+
+
+-- ---------------------------------------------------------------------
+-- ROLE DE SISTEMA DO UTILIZADOR
+-- ---------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.current_user_system_role()
+RETURNS public.system_role_type
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT COALESCE(
+        (
+            SELECT p.system_role
+            FROM public.profiles p
+            WHERE p.id = auth.uid()
+              AND p.active = TRUE
+        ),
+        'USER'::public.system_role_type
+    );
+$$;
+
+
+-- ---------------------------------------------------------------------
+-- SUPER ADMIN
+-- ---------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.current_user_is_super_admin()
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.profiles p
+        WHERE p.id = auth.uid()
+          AND p.system_role = 'SUPER_ADMIN'
+          AND p.active = TRUE
+    );
+$$;
+
+
+-- ---------------------------------------------------------------------
+-- UNIVERSAL CASHIER
+-- ---------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.current_user_is_universal_cashier()
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.profiles p
+        WHERE p.id = auth.uid()
+          AND p.system_role = 'UNIVERSAL_CASHIER'
+          AND p.active = TRUE
+    );
+$$;
+
+
+-- ---------------------------------------------------------------------
+-- ACESSO À FARMÁCIA
+--
+-- SUPER_ADMIN       -> qualquer farmácia
+-- UNIVERSAL_CASHIER -> qualquer farmácia
+-- USER              -> somente store_users
+-- ---------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.current_user_has_store_access(
+    check_store_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT
+        public.current_user_is_super_admin()
+        OR public.current_user_is_universal_cashier()
+        OR EXISTS (
+            SELECT 1
+            FROM public.store_users su
+            WHERE su.store_id = check_store_id
+              AND su.user_id = auth.uid()
+              AND su.active = TRUE
+        );
+$$;
+
+
+-- ---------------------------------------------------------------------
+-- ADMIN DE UMA FARMÁCIA ESPECÍFICA
+--
+-- SUPER_ADMIN também passa.
+-- ADMIN local passa somente onde possui role ADMIN.
+-- ---------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.current_user_is_store_admin(
+    check_store_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT
+        public.current_user_is_super_admin()
+        OR EXISTS (
+            SELECT 1
+            FROM public.store_users su
+            WHERE su.store_id = check_store_id
+              AND su.user_id = auth.uid()
+              AND su.role = 'ADMIN'
+              AND su.active = TRUE
+        );
+$$;
+
+
+-- ---------------------------------------------------------------------
+-- ADMIN OU JUNIOR MANAGER DE UMA FARMÁCIA
+-- ---------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.current_user_is_store_manager(
+    check_store_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT
+        public.current_user_is_super_admin()
+        OR EXISTS (
+            SELECT 1
+            FROM public.store_users su
+            WHERE su.store_id = check_store_id
+              AND su.user_id = auth.uid()
+              AND su.role IN ('ADMIN', 'JUNIOR_MANAGER')
+              AND su.active = TRUE
+        );
+$$;
+
+
+-- ---------------------------------------------------------------------
+-- CAIXA DA FARMÁCIA
+--
+-- SUPER_ADMIN
+-- UNIVERSAL_CASHIER
+-- CASHIER daquela farmácia
+--
+-- ADMIN/JUNIOR_MANAGER também possuem acesso à farmácia, mas isso
+-- não os transforma em "caixa".
+-- ---------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.current_user_can_operate_cash(
+    check_store_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT
+        public.current_user_is_super_admin()
+        OR public.current_user_is_universal_cashier()
+        OR EXISTS (
+            SELECT 1
+            FROM public.store_users su
+            WHERE su.store_id = check_store_id
+              AND su.user_id = auth.uid()
+              AND su.role = 'CASHIER'
+              AND su.active = TRUE
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM public.store_users su
+            WHERE su.store_id = check_store_id
+              AND su.user_id = auth.uid()
+              AND su.role IN ('ADMIN', 'JUNIOR_MANAGER')
+              AND su.active = TRUE
+        );
+$$;
+
+
+-- ---------------------------------------------------------------------
+-- ROLE LOCAL DO UTILIZADOR NUMA FARMÁCIA
+-- ---------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.current_user_store_role(
+    check_store_id UUID
+)
+RETURNS public.user_role_type
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT su.role
+    FROM public.store_users su
+    WHERE su.store_id = check_store_id
+      AND su.user_id = auth.uid()
+      AND su.active = TRUE
+    LIMIT 1;
+$$;
+
+
+-- =====================================================================
+-- 7. PROTEGER A INTEGRIDADE DE store_users
+--
+-- Um CASHIER normal só pode pertencer a UMA farmácia.
+--
+-- ADMIN e JUNIOR_MANAGER podem pertencer a várias.
+--
+-- SUPER_ADMIN / UNIVERSAL_CASHIER não precisam de associação em
+-- store_users para obter acesso universal.
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION public.enforce_single_store_cashier()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+
+    IF NEW.role = 'CASHIER' AND NEW.active = TRUE THEN
+
+        IF EXISTS (
+            SELECT 1
+            FROM public.store_users su
+            WHERE su.user_id = NEW.user_id
+              AND su.active = TRUE
+              AND su.role = 'CASHIER'
+              AND su.id <> COALESCE(NEW.id, '00000000-0000-0000-0000-000000000000'::UUID)
+        ) THEN
+            RAISE EXCEPTION
+                'Este utilizador já está associado a uma farmácia como CASHIER. Um CASHIER normal só pode pertencer a uma única farmácia.';
+        END IF;
+
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+DROP TRIGGER IF EXISTS trg_enforce_single_store_cashier
+ON public.store_users;
+
+CREATE TRIGGER trg_enforce_single_store_cashier
+BEFORE INSERT OR UPDATE OF user_id, role, active, store_id
+ON public.store_users
+FOR EACH ROW
+EXECUTE FUNCTION public.enforce_single_store_cashier();
+
+
+-- =====================================================================
+-- 8. GARANTIR QUE default_store_id PERTENÇA AO UTILIZADOR
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION public.validate_default_store()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+
+    IF NEW.default_store_id IS NOT NULL THEN
+
+        IF NEW.system_role IN ('SUPER_ADMIN', 'UNIVERSAL_CASHIER') THEN
+            RETURN NEW;
+        END IF;
+
+        IF NOT EXISTS (
+            SELECT 1
+            FROM public.store_users su
+            WHERE su.user_id = NEW.id
+              AND su.store_id = NEW.default_store_id
+              AND su.active = TRUE
+        ) THEN
+            RAISE EXCEPTION
+                'A farmácia padrão deve pertencer ao utilizador.';
+        END IF;
+
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+DROP TRIGGER IF EXISTS trg_validate_default_store
+ON public.profiles;
+
+CREATE TRIGGER trg_validate_default_store
+BEFORE INSERT OR UPDATE OF default_store_id, system_role
+ON public.profiles
+FOR EACH ROW
+EXECUTE FUNCTION public.validate_default_store();
+
+
+-- =====================================================================
+-- 9. RLS — PROFILES
+--
+-- Utilizador:
+--   pode VER o próprio perfil.
+--
+-- SUPER_ADMIN:
+--   pode administrar perfis.
+--
+-- O próprio utilizador NÃO pode alterar:
+--   system_role
+--   role
+--   active
+-- =====================================================================
+
+DROP POLICY IF EXISTS "profiles_self_and_admin" ON public.profiles;
+
+DROP POLICY IF EXISTS "profiles_select_own_or_super_admin"
+ON public.profiles;
+
+DROP POLICY IF EXISTS "profiles_update_super_admin"
+ON public.profiles;
+
+DROP POLICY IF EXISTS "profiles_insert_super_admin"
+ON public.profiles;
+
+DROP POLICY IF EXISTS "profiles_delete_super_admin"
+ON public.profiles;
+
+
+CREATE POLICY "profiles_select_own_or_super_admin"
+ON public.profiles
+FOR SELECT
+USING (
+    id = auth.uid()
+    OR public.current_user_is_super_admin()
+);
+
+
+CREATE POLICY "profiles_update_super_admin"
+ON public.profiles
+FOR UPDATE
+USING (
+    public.current_user_is_super_admin()
+)
+WITH CHECK (
+    public.current_user_is_super_admin()
+);
+
+
+CREATE POLICY "profiles_insert_super_admin"
+ON public.profiles
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_super_admin()
+);
+
+
+CREATE POLICY "profiles_delete_super_admin"
+ON public.profiles
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 10. RLS — STORE_USERS
+--
+-- Qualquer utilizador pode CONSULTAR as suas próprias associações.
+--
+-- Somente SUPER_ADMIN ou ADMIN da respectiva farmácia pode administrar
+-- associações daquela farmácia.
+--
+-- Um ADMIN não pode alterar a associação de outra farmácia.
+-- =====================================================================
+
+DROP POLICY IF EXISTS "store_users_access" ON public.store_users;
+
+DROP POLICY IF EXISTS "store_users_select"
+ON public.store_users;
+
+DROP POLICY IF EXISTS "store_users_insert"
+ON public.store_users;
+
+DROP POLICY IF EXISTS "store_users_update"
+ON public.store_users;
+
+DROP POLICY IF EXISTS "store_users_delete"
+ON public.store_users;
+
+
+CREATE POLICY "store_users_select"
+ON public.store_users
+FOR SELECT
+USING (
+    user_id = auth.uid()
+    OR public.current_user_is_super_admin()
+    OR public.current_user_is_store_admin(store_id)
+);
+
+
+CREATE POLICY "store_users_insert"
+ON public.store_users
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_super_admin()
+    OR public.current_user_is_store_admin(store_id)
+);
+
+
+CREATE POLICY "store_users_update"
+ON public.store_users
+FOR UPDATE
+USING (
+    public.current_user_is_super_admin()
+    OR public.current_user_is_store_admin(store_id)
+)
+WITH CHECK (
+    public.current_user_is_super_admin()
+    OR public.current_user_is_store_admin(store_id)
+);
+
+
+CREATE POLICY "store_users_delete"
+ON public.store_users
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+    OR public.current_user_is_store_admin(store_id)
+);
+
+
+-- =====================================================================
+-- 11. RLS — STORES
+--
+-- Leitura:
+--   utilizadores da farmácia
+--   SUPER_ADMIN
+--   UNIVERSAL_CASHIER
+--
+-- Alteração estrutural:
+--   SUPER_ADMIN
+--   ADMIN daquela farmácia
+-- =====================================================================
+
+DROP POLICY IF EXISTS "stores_access" ON public.stores;
+
+DROP POLICY IF EXISTS "stores_select"
+ON public.stores;
+
+DROP POLICY IF EXISTS "stores_insert"
+ON public.stores;
+
+DROP POLICY IF EXISTS "stores_update"
+ON public.stores;
+
+DROP POLICY IF EXISTS "stores_delete"
+ON public.stores;
+
+
+CREATE POLICY "stores_select"
+ON public.stores
+FOR SELECT
+USING (
+    public.current_user_has_store_access(id)
+);
+
+
+CREATE POLICY "stores_insert"
+ON public.stores
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_super_admin()
+);
+
+
+CREATE POLICY "stores_update"
+ON public.stores
+FOR UPDATE
+USING (
+    public.current_user_is_super_admin()
+    OR public.current_user_is_store_admin(id)
+)
+WITH CHECK (
+    public.current_user_is_super_admin()
+    OR public.current_user_is_store_admin(id)
+);
+
+
+CREATE POLICY "stores_delete"
+ON public.stores
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 12. PRODUCT UNITS
+-- =====================================================================
+
+DROP POLICY IF EXISTS "units_access" ON public.product_units;
+
+CREATE POLICY "units_select"
+ON public.product_units
+FOR SELECT
+USING (
+    is_system = TRUE
+    OR store_id IS NULL
+    OR public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "units_insert"
+ON public.product_units
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_super_admin()
+    OR (
+        store_id IS NOT NULL
+        AND public.current_user_is_store_manager(store_id)
+    )
+);
+
+CREATE POLICY "units_update"
+ON public.product_units
+FOR UPDATE
+USING (
+    public.current_user_is_super_admin()
+    OR (
+        store_id IS NOT NULL
+        AND public.current_user_is_store_manager(store_id)
+    )
+)
+WITH CHECK (
+    public.current_user_is_super_admin()
+    OR (
+        store_id IS NOT NULL
+        AND public.current_user_is_store_manager(store_id)
+    )
+);
+
+CREATE POLICY "units_delete"
+ON public.product_units
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+    OR (
+        store_id IS NOT NULL
+        AND public.current_user_is_store_manager(store_id)
+    )
+);
+
+
+-- =====================================================================
+-- 13. PRODUCTS
+--
+-- Leitura -> qualquer utilizador autorizado da farmácia.
+-- Escrita -> ADMIN / JUNIOR_MANAGER / SUPER_ADMIN.
+-- CASHIER não altera catálogo.
+-- =====================================================================
+
+DROP POLICY IF EXISTS "products_access" ON public.products;
+
+CREATE POLICY "products_select"
+ON public.products
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "products_insert"
+ON public.products
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "products_update"
+ON public.products
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "products_delete"
+ON public.products
+FOR DELETE
+USING (
+    public.current_user_is_store_manager(store_id)
+);
+
+
+-- =====================================================================
+-- 14. PRODUCT PACKAGES
+-- =====================================================================
+
+DROP POLICY IF EXISTS "packages_access" ON public.product_packages;
+
+CREATE POLICY "packages_select"
+ON public.product_packages
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "packages_insert"
+ON public.product_packages
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "packages_update"
+ON public.product_packages
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "packages_delete"
+ON public.product_packages
+FOR DELETE
+USING (
+    public.current_user_is_store_manager(store_id)
+);
+
+
+-- =====================================================================
+-- 15. BATCHES
+-- =====================================================================
+
+DROP POLICY IF EXISTS "batches_access" ON public.batches;
+
+CREATE POLICY "batches_select"
+ON public.batches
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "batches_insert"
+ON public.batches
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "batches_update"
+ON public.batches
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "batches_delete"
+ON public.batches
+FOR DELETE
+USING (
+    public.current_user_is_store_manager(store_id)
+);
+
+
+-- =====================================================================
+-- 16. SUPPLIERS
+-- =====================================================================
+
+DROP POLICY IF EXISTS "suppliers_access" ON public.suppliers;
+
+CREATE POLICY "suppliers_select"
+ON public.suppliers
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "suppliers_insert"
+ON public.suppliers
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "suppliers_update"
+ON public.suppliers
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "suppliers_delete"
+ON public.suppliers
+FOR DELETE
+USING (
+    public.current_user_is_store_manager(store_id)
+);
+
+
+-- =====================================================================
+-- 17. PURCHASES
+--
+-- Entrada real deve ser feita pela RPC protegida.
+-- Leitura para utilizadores autorizados.
+-- Escrita direta somente para managers.
+-- =====================================================================
+
+DROP POLICY IF EXISTS "purchases_access" ON public.purchases;
+
+CREATE POLICY "purchases_select"
+ON public.purchases
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "purchases_insert"
+ON public.purchases
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "purchases_update"
+ON public.purchases
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "purchases_delete"
+ON public.purchases
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 18. PURCHASE ITEMS
+-- =====================================================================
+
+DROP POLICY IF EXISTS "purchase_items_access"
+ON public.purchase_items;
+
+CREATE POLICY "purchase_items_select"
+ON public.purchase_items
+FOR SELECT
+USING (
+    EXISTS (
+        SELECT 1
+        FROM public.purchases p
+        WHERE p.id = purchase_items.purchase_id
+          AND public.current_user_has_store_access(p.store_id)
+    )
+);
+
+CREATE POLICY "purchase_items_insert"
+ON public.purchase_items
+FOR INSERT
+WITH CHECK (
+    EXISTS (
+        SELECT 1
+        FROM public.purchases p
+        WHERE p.id = purchase_items.purchase_id
+          AND public.current_user_is_store_manager(p.store_id)
+    )
+);
+
+CREATE POLICY "purchase_items_update"
+ON public.purchase_items
+FOR UPDATE
+USING (
+    EXISTS (
+        SELECT 1
+        FROM public.purchases p
+        WHERE p.id = purchase_items.purchase_id
+          AND public.current_user_is_store_manager(p.store_id)
+    )
+)
+WITH CHECK (
+    EXISTS (
+        SELECT 1
+        FROM public.purchases p
+        WHERE p.id = purchase_items.purchase_id
+          AND public.current_user_is_store_manager(p.store_id)
+    )
+);
+
+CREATE POLICY "purchase_items_delete"
+ON public.purchase_items
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 19. STOCK MOVEMENTS
+--
+-- Histórico não deve ser apagado por utilizadores normais.
+-- =====================================================================
+
+DROP POLICY IF EXISTS "stock_movements_access"
+ON public.stock_movements;
+
+CREATE POLICY "stock_movements_select"
+ON public.stock_movements
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "stock_movements_insert"
+ON public.stock_movements
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "stock_movements_delete"
+ON public.stock_movements
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 20. TRANSFERS
+--
+-- Origem e destino precisam ser autorizados.
+-- =====================================================================
+
+DROP POLICY IF EXISTS "transfers_access"
+ON public.transfers;
+
+CREATE POLICY "transfers_select"
+ON public.transfers
+FOR SELECT
+USING (
+    public.current_user_has_store_access(source_store_id)
+    OR public.current_user_has_store_access(destination_store_id)
+);
+
+CREATE POLICY "transfers_insert"
+ON public.transfers
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(source_store_id)
+    AND public.current_user_has_store_access(destination_store_id)
+);
+
+CREATE POLICY "transfers_update"
+ON public.transfers
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(source_store_id)
+    OR public.current_user_is_store_manager(destination_store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(source_store_id)
+    OR public.current_user_is_store_manager(destination_store_id)
+);
+
+CREATE POLICY "transfers_delete"
+ON public.transfers
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 21. TRANSFER ITEMS
+-- =====================================================================
+
+CREATE POLICY "transfer_items_select"
+ON public.transfer_items
+FOR SELECT
+USING (
+    EXISTS (
+        SELECT 1
+        FROM public.transfers t
+        WHERE t.id = transfer_items.transfer_id
+          AND (
+              public.current_user_has_store_access(t.source_store_id)
+              OR public.current_user_has_store_access(t.destination_store_id)
+          )
+    )
+);
+
+CREATE POLICY "transfer_items_insert"
+ON public.transfer_items
+FOR INSERT
+WITH CHECK (
+    EXISTS (
+        SELECT 1
+        FROM public.transfers t
+        WHERE t.id = transfer_items.transfer_id
+          AND (
+              public.current_user_is_store_manager(t.source_store_id)
+              OR public.current_user_is_store_manager(t.destination_store_id)
+          )
+    )
+);
+
+CREATE POLICY "transfer_items_update"
+ON public.transfer_items
+FOR UPDATE
+USING (
+    EXISTS (
+        SELECT 1
+        FROM public.transfers t
+        WHERE t.id = transfer_items.transfer_id
+          AND (
+              public.current_user_is_store_manager(t.source_store_id)
+              OR public.current_user_is_store_manager(t.destination_store_id)
+          )
+    )
+)
+WITH CHECK (
+    EXISTS (
+        SELECT 1
+        FROM public.transfers t
+        WHERE t.id = transfer_items.transfer_id
+          AND (
+              public.current_user_is_store_manager(t.source_store_id)
+              OR public.current_user_is_store_manager(t.destination_store_id)
+          )
+    )
+);
+
+
+-- =====================================================================
+-- 22. CASH REGISTERS
+-- =====================================================================
+
+DROP POLICY IF EXISTS "cash_registers_access"
+ON public.cash_registers;
+
+CREATE POLICY "cash_registers_select"
+ON public.cash_registers
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "cash_registers_insert"
+ON public.cash_registers
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "cash_registers_update"
+ON public.cash_registers
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "cash_registers_delete"
+ON public.cash_registers
+FOR DELETE
+USING (
+    public.current_user_is_store_admin(store_id)
+);
+
+
+-- =====================================================================
+-- 23. CASH SESSIONS
+--
+-- Leitura:
+--   utilizador autorizado.
+--
+-- Alteração direta:
+--   managers.
+--
+-- Operações normais de abertura/fecho devem usar RPCs.
+-- =====================================================================
+
+DROP POLICY IF EXISTS "cash_sessions_access"
+ON public.cash_sessions;
+
+CREATE POLICY "cash_sessions_select"
+ON public.cash_sessions
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "cash_sessions_insert"
+ON public.cash_sessions
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+    OR (
+        public.current_user_can_operate_cash(store_id)
+        AND user_id = auth.uid()
+    )
+);
+
+CREATE POLICY "cash_sessions_update"
+ON public.cash_sessions
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+    OR (
+        public.current_user_can_operate_cash(store_id)
+        AND user_id = auth.uid()
+    )
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+    OR (
+        public.current_user_can_operate_cash(store_id)
+        AND user_id = auth.uid()
+    )
+);
+
+
+-- =====================================================================
+-- 24. CASH MOVEMENTS
+-- =====================================================================
+
+DROP POLICY IF EXISTS "cash_movements_access"
+ON public.cash_movements;
+
+CREATE POLICY "cash_movements_select"
+ON public.cash_movements
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "cash_movements_insert"
+ON public.cash_movements
+FOR INSERT
+WITH CHECK (
+    public.current_user_can_operate_cash(store_id)
+);
+
+CREATE POLICY "cash_movements_update"
+ON public.cash_movements
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "cash_movements_delete"
+ON public.cash_movements
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 25. SALES
+-- =====================================================================
+
+DROP POLICY IF EXISTS "sales_access"
+ON public.sales;
+
+CREATE POLICY "sales_select"
+ON public.sales
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "sales_insert"
+ON public.sales
+FOR INSERT
+WITH CHECK (
+    public.current_user_can_operate_cash(store_id)
+);
+
+CREATE POLICY "sales_update"
+ON public.sales
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "sales_delete"
+ON public.sales
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 26. SALE ITEMS
+-- =====================================================================
+
+DROP POLICY IF EXISTS "sale_items_access"
+ON public.sale_items;
+
+CREATE POLICY "sale_items_select"
+ON public.sale_items
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "sale_items_insert"
+ON public.sale_items
+FOR INSERT
+WITH CHECK (
+    public.current_user_can_operate_cash(store_id)
+);
+
+CREATE POLICY "sale_items_update"
+ON public.sale_items
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "sale_items_delete"
+ON public.sale_items
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 27. LOSSES
+-- =====================================================================
+
+DROP POLICY IF EXISTS "losses_access"
+ON public.losses;
+
+CREATE POLICY "losses_select"
+ON public.losses
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "losses_insert"
+ON public.losses
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "losses_update"
+ON public.losses
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "losses_delete"
+ON public.losses
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 28. CAPITAL
+-- =====================================================================
+
+DROP POLICY IF EXISTS "capital_access"
+ON public.capital_transactions;
+
+CREATE POLICY "capital_select"
+ON public.capital_transactions
+FOR SELECT
+USING (
+    public.current_user_is_store_admin(store_id)
+);
+
+CREATE POLICY "capital_insert"
+ON public.capital_transactions
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_admin(store_id)
+);
+
+CREATE POLICY "capital_update"
+ON public.capital_transactions
+FOR UPDATE
+USING (
+    public.current_user_is_store_admin(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_admin(store_id)
+);
+
+CREATE POLICY "capital_delete"
+ON public.capital_transactions
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 29. FINANCIAL TRANSACTIONS
+-- =====================================================================
+
+DROP POLICY IF EXISTS "finance_access"
+ON public.financial_transactions;
+
+CREATE POLICY "finance_select"
+ON public.financial_transactions
+FOR SELECT
+USING (
+    public.current_user_is_store_admin(store_id)
+);
+
+CREATE POLICY "finance_insert"
+ON public.financial_transactions
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_admin(store_id)
+);
+
+CREATE POLICY "finance_update"
+ON public.financial_transactions
+FOR UPDATE
+USING (
+    public.current_user_is_store_admin(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_admin(store_id)
+);
+
+CREATE POLICY "finance_delete"
+ON public.financial_transactions
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 30. DAILY CLOSINGS
+-- =====================================================================
+
+DROP POLICY IF EXISTS "closings_access"
+ON public.daily_closings;
+
+CREATE POLICY "closings_select"
+ON public.daily_closings
+FOR SELECT
+USING (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "closings_insert"
+ON public.daily_closings
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "closings_update"
+ON public.daily_closings
+FOR UPDATE
+USING (
+    public.current_user_is_store_manager(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_manager(store_id)
+);
+
+CREATE POLICY "closings_delete"
+ON public.daily_closings
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 31. AUDIT LOGS
+--
+-- Auditoria:
+--   SUPER_ADMIN -> tudo
+--   outros -> somente registros próprios
+--
+-- Escrita normal deve ser feita pelas RPCs/backend.
+-- =====================================================================
+
+DROP POLICY IF EXISTS "audit_access"
+ON public.audit_logs;
+
+CREATE POLICY "audit_select"
+ON public.audit_logs
+FOR SELECT
+USING (
+    public.current_user_is_super_admin()
+    OR user_id = auth.uid()
+);
+
+CREATE POLICY "audit_insert"
+ON public.audit_logs
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_super_admin()
+    OR user_id = auth.uid()
+);
+
+CREATE POLICY "audit_delete"
+ON public.audit_logs
+FOR DELETE
+USING (
+    public.current_user_is_super_admin()
+);
+
+
+-- =====================================================================
+-- 32. SETTINGS
+-- =====================================================================
+
+DROP POLICY IF EXISTS "settings_access"
+ON public.settings;
+
+CREATE POLICY "settings_select"
+ON public.settings
+FOR SELECT
+USING (
+    public.current_user_has_store_access(store_id)
+);
+
+CREATE POLICY "settings_insert"
+ON public.settings
+FOR INSERT
+WITH CHECK (
+    public.current_user_is_store_admin(store_id)
+);
+
+CREATE POLICY "settings_update"
+ON public.settings
+FOR UPDATE
+USING (
+    public.current_user_is_store_admin(store_id)
+)
+WITH CHECK (
+    public.current_user_is_store_admin(store_id)
+);
+
+CREATE POLICY "settings_delete"
+ON public.settings
+FOR DELETE
+USING (
+    public.current_user_is_store_admin(store_id)
+);
+
+
+-- =====================================================================
+-- 33. PROTEGER AS RPCs SECURITY DEFINER
+--
+-- A autorização é verificada DENTRO das funções.
+-- =====================================================================
+
+
+-- ---------------------------------------------------------------------
+-- PROCESS SALE
+-- ---------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.process_atomic_sale(
+    p_store_id UUID,
+    p_session_id UUID,
+    p_customer_name VARCHAR(255),
+    p_customer_tax_id VARCHAR(50),
+    p_payment_method payment_method_type,
+    p_discount_amount NUMERIC(12, 2),
+    p_items JSONB
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_user_id UUID := auth.uid();
+    v_sale_id UUID;
+    v_receipt_number VARCHAR(100);
+    v_total_gross NUMERIC(12, 2) := 0;
+    v_total_net NUMERIC(12, 2) := 0;
+    v_total_cogs NUMERIC(12, 4) := 0;
+    v_gross_profit NUMERIC(12, 2) := 0;
+    v_item RECORD;
+    v_qty_needed NUMERIC(12, 3);
+    v_qty_from_batch NUMERIC(12, 3);
+    v_batch RECORD;
+    v_prod RECORD;
+    v_batch_cogs NUMERIC(12, 4);
+    v_item_cogs NUMERIC(12, 4);
+    v_item_total NUMERIC(12, 2);
+    v_session RECORD;
+BEGIN
+
+    IF NOT public.current_user_can_operate_cash(p_store_id) THEN
+        RAISE EXCEPTION 'Utilizador sem permissão para operar o caixa desta farmácia.';
+    END IF;
+
+    IF p_items IS NULL OR jsonb_array_length(p_items) = 0 THEN
+        RAISE EXCEPTION 'A venda deve conter pelo menos um produto.';
+    END IF;
+
+    IF p_discount_amount IS NULL OR p_discount_amount < 0 THEN
+        RAISE EXCEPTION 'Desconto inválido.';
+    END IF;
+
+    /*
+     * Sessão:
+     * CASHIER normal -> própria sessão.
+     * UNIVERSAL_CASHIER / SUPER_ADMIN -> sessão informada.
+     * Manager -> também pode operar.
+     */
+    IF p_session_id IS NOT NULL THEN
+
+        SELECT *
+        INTO v_session
+        FROM public.cash_sessions
+        WHERE id = p_session_id
+          AND store_id = p_store_id
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Sessão de caixa não encontrada nesta farmácia.';
+        END IF;
+
+        IF v_session.status <> 'OPEN' THEN
+            RAISE EXCEPTION 'A sessão de caixa está fechada.';
+        END IF;
+
+        IF public.current_user_system_role()
+           NOT IN ('SUPER_ADMIN', 'UNIVERSAL_CASHIER')
+           AND NOT public.current_user_is_store_manager(p_store_id)
+           AND v_session.user_id <> v_user_id THEN
+
+            RAISE EXCEPTION 'Esta sessão de caixa pertence a outro utilizador.';
+        END IF;
+
+    ELSE
+
+        SELECT *
+        INTO v_session
+        FROM public.cash_sessions
+        WHERE store_id = p_store_id
+          AND status = 'OPEN'
+          AND (
+              user_id = v_user_id
+              OR public.current_user_system_role()
+                 IN ('SUPER_ADMIN', 'UNIVERSAL_CASHIER')
+              OR public.current_user_is_store_manager(p_store_id)
+          )
+        ORDER BY opened_at DESC
+        LIMIT 1
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Nenhuma sessão de caixa aberta disponível.';
+        END IF;
+
+        p_session_id := v_session.id;
+
+    END IF;
+
+
+    -- ---------------------------------------------------------------
+    -- TOTAL BRUTO
+    -- ---------------------------------------------------------------
+
+    FOR v_item IN
+        SELECT *
+        FROM jsonb_to_recordset(p_items) AS x(
+            product_id UUID,
+            package_id UUID,
+            unit_id UUID,
+            quantity NUMERIC(12,3),
+            unit_price NUMERIC(12,4),
+            multiplier_to_base NUMERIC(12,3)
+        )
+    LOOP
+
+        IF v_item.quantity IS NULL OR v_item.quantity <= 0 THEN
+            RAISE EXCEPTION 'Quantidade inválida para um dos produtos.';
+        END IF;
+
+        IF v_item.unit_price IS NULL OR v_item.unit_price < 0 THEN
+            RAISE EXCEPTION 'Preço inválido para um dos produtos.';
+        END IF;
+
+        IF COALESCE(v_item.multiplier_to_base, 1) <= 0 THEN
+            RAISE EXCEPTION 'Multiplicador inválido.';
+        END IF;
+
+        v_item_total :=
+            ROUND(
+                (v_item.quantity * v_item.unit_price)::NUMERIC,
+                2
+            );
+
+        v_total_gross := v_total_gross + v_item_total;
+
+    END LOOP;
+
+    v_total_net :=
+        GREATEST(
+            0,
+            v_total_gross - COALESCE(p_discount_amount, 0)
+        );
+
+
+    -- ---------------------------------------------------------------
+    -- RECIBO
+    -- ---------------------------------------------------------------
+
+    v_receipt_number :=
+        'REC-' ||
+        TO_CHAR(NOW(), 'YYYYMMDD') ||
+        '-' ||
+        LPAD(
+            FLOOR(RANDOM() * 900000 + 100000)::TEXT,
+            6,
+            '0'
+        );
+
+
+    -- ---------------------------------------------------------------
+    -- VENDA
+    -- ---------------------------------------------------------------
+
+    INSERT INTO public.sales (
+        store_id,
+        session_id,
+        receipt_number,
+        customer_name,
+        customer_tax_id,
+        total_gross,
+        discount_amount,
+        total_net,
+        payment_method,
+        status,
+        created_by
+    )
+    VALUES (
+        p_store_id,
+        p_session_id,
+        v_receipt_number,
+        COALESCE(p_customer_name, 'Consumidor Final'),
+        p_customer_tax_id,
+        v_total_gross,
+        COALESCE(p_discount_amount, 0),
+        v_total_net,
+        p_payment_method,
+        'COMPLETED',
+        v_user_id
+    )
+    RETURNING id INTO v_sale_id;
+
+
+    -- ---------------------------------------------------------------
+    -- PROCESSAMENTO DOS PRODUTOS
+    -- ---------------------------------------------------------------
+
+    FOR v_item IN
+        SELECT *
+        FROM jsonb_to_recordset(p_items) AS x(
+            product_id UUID,
+            package_id UUID,
+            unit_id UUID,
+            quantity NUMERIC(12,3),
+            unit_price NUMERIC(12,4),
+            multiplier_to_base NUMERIC(12,3)
+        )
+    LOOP
+
+        v_qty_needed :=
+            v_item.quantity *
+            COALESCE(v_item.multiplier_to_base, 1);
+
+        v_item_total :=
+            ROUND(
+                (v_item.quantity * v_item.unit_price)::NUMERIC,
+                2
+            );
+
+        v_item_cogs := 0;
+
+
+        SELECT *
+        INTO v_prod
+        FROM public.products
+        WHERE id = v_item.product_id
+          AND store_id = p_store_id
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Produto não encontrado nesta farmácia.';
+        END IF;
+
+
+        IF v_prod.current_stock_base < v_qty_needed THEN
+            RAISE EXCEPTION
+                'Estoque insuficiente para "%". Disponível: %, Solicitado: %',
+                v_prod.name,
+                v_prod.current_stock_base,
+                v_qty_needed;
+        END IF;
+
+
+        -- FEFO
+        FOR v_batch IN
+            SELECT *
+            FROM public.batches
+            WHERE product_id = v_item.product_id
+              AND store_id = p_store_id
+              AND current_quantity_base > 0
+            ORDER BY expiry_date ASC, created_at ASC
+            FOR UPDATE
+        LOOP
+
+            EXIT WHEN v_qty_needed <= 0;
+
+            v_qty_from_batch :=
+                LEAST(
+                    v_batch.current_quantity_base,
+                    v_qty_needed
+                );
+
+            v_batch_cogs :=
+                v_qty_from_batch * v_batch.cost_per_base;
+
+            v_item_cogs :=
+                v_item_cogs + v_batch_cogs;
+
+
+            UPDATE public.batches
+            SET current_quantity_base =
+                    current_quantity_base - v_qty_from_batch,
+                status =
+                    CASE
+                        WHEN current_quantity_base - v_qty_from_batch = 0
+                        THEN 'EXHAUSTED'
+                        ELSE status
+                    END
+            WHERE id = v_batch.id;
+
+
+            INSERT INTO public.sale_items (
+                sale_id,
+                store_id,
+                product_id,
+                batch_id,
+                package_id,
+                unit_id,
+                quantity_sold,
+                multiplier_to_base,
+                quantity_base,
+                unit_price,
+                total_price,
+                unit_cogs,
+                total_cogs
+            )
+            VALUES (
+                v_sale_id,
+                p_store_id,
+                v_item.product_id,
+                v_batch.id,
+                v_item.package_id,
+                v_item.unit_id,
+                v_qty_from_batch /
+                    COALESCE(v_item.multiplier_to_base, 1),
+                COALESCE(v_item.multiplier_to_base, 1),
+                v_qty_from_batch,
+                v_item.unit_price,
+                ROUND(
+                    (
+                        (
+                            v_qty_from_batch /
+                            COALESCE(v_item.multiplier_to_base, 1)
+                        ) *
+                        v_item.unit_price
+                    )::NUMERIC,
+                    2
+                ),
+                v_batch.cost_per_base,
+                v_batch_cogs
+            );
+
+
+            INSERT INTO public.stock_movements (
+                store_id,
+                product_id,
+                batch_id,
+                movement_type,
+                quantity_base,
+                previous_stock_base,
+                new_stock_base,
+                unit_cost,
+                reference_id,
+                reference_type,
+                reason,
+                created_by
+            )
+            VALUES (
+                p_store_id,
+                v_item.product_id,
+                v_batch.id,
+                'SALE',
+                -v_qty_from_batch,
+                v_prod.current_stock_base - (
+                    v_item.quantity *
+                    COALESCE(v_item.multiplier_to_base, 1)
+                    - v_qty_needed
+                ),
+                v_prod.current_stock_base - (
+                    v_item.quantity *
+                    COALESCE(v_item.multiplier_to_base, 1)
+                    - v_qty_needed
+                ) - v_qty_from_batch,
+                v_batch.cost_per_base,
+                v_sale_id,
+                'SALE',
+                'Venda realizada. Recibo: ' || v_receipt_number,
+                v_user_id
+            );
+
+            v_qty_needed :=
+                v_qty_needed - v_qty_from_batch;
+
+        END LOOP;
+
+
+        -- Estoque sem lote
+        IF v_qty_needed > 0 THEN
+
+            v_batch_cogs :=
+                v_qty_needed *
+                COALESCE(v_prod.cost_price_base, 0);
+
+            v_item_cogs :=
+                v_item_cogs + v_batch_cogs;
+
+
+            INSERT INTO public.sale_items (
+                sale_id,
+                store_id,
+                product_id,
+                batch_id,
+                package_id,
+                unit_id,
+                quantity_sold,
+                multiplier_to_base,
+                quantity_base,
+                unit_price,
+                total_price,
+                unit_cogs,
+                total_cogs
+            )
+            VALUES (
+                v_sale_id,
+                p_store_id,
+                v_item.product_id,
+                NULL,
+                v_item.package_id,
+                v_item.unit_id,
+                v_qty_needed /
+                    COALESCE(v_item.multiplier_to_base, 1),
+                COALESCE(v_item.multiplier_to_base, 1),
+                v_qty_needed,
+                v_item.unit_price,
+                ROUND(
+                    (
+                        (
+                            v_qty_needed /
+                            COALESCE(v_item.multiplier_to_base, 1)
+                        ) *
+                        v_item.unit_price
+                    )::NUMERIC,
+                    2
+                ),
+                COALESCE(v_prod.cost_price_base, 0),
+                v_batch_cogs
+            );
+
+
+            INSERT INTO public.stock_movements (
+                store_id,
+                product_id,
+                batch_id,
+                movement_type,
+                quantity_base,
+                previous_stock_base,
+                new_stock_base,
+                unit_cost,
+                reference_id,
+                reference_type,
+                reason,
+                created_by
+            )
+            VALUES (
+                p_store_id,
+                v_item.product_id,
+                NULL,
+                'SALE',
+                -v_qty_needed,
+                v_prod.current_stock_base -
+                    (
+                        v_item.quantity *
+                        COALESCE(v_item.multiplier_to_base, 1)
+                    ),
+                v_prod.current_stock_base -
+                    (
+                        v_item.quantity *
+                        COALESCE(v_item.multiplier_to_base, 1)
+                    ) -
+                    v_qty_needed,
+                COALESCE(v_prod.cost_price_base, 0),
+                v_sale_id,
+                'SALE',
+                'Venda realizada no estoque geral. Recibo: ' ||
+                    v_receipt_number,
+                v_user_id
+            );
+
+            v_qty_needed := 0;
+
+        END IF;
+
+
+        UPDATE public.products
+        SET current_stock_base =
+                current_stock_base -
+                (
+                    v_item.quantity *
+                    COALESCE(v_item.multiplier_to_base, 1)
+                ),
+            updated_at = NOW()
+        WHERE id = v_item.product_id
+          AND store_id = p_store_id;
+
+
+        v_total_cogs :=
+            v_total_cogs + v_item_cogs;
+
+    END LOOP;
+
+
+    v_gross_profit :=
+        v_total_net - v_total_cogs;
+
+
+    UPDATE public.sales
+    SET total_cogs = v_total_cogs,
+        gross_profit = v_gross_profit
+    WHERE id = v_sale_id;
+
+
+    -- ---------------------------------------------------------------
+    -- MOVIMENTO DE CAIXA
+    -- ---------------------------------------------------------------
+
+    INSERT INTO public.cash_movements (
+        store_id,
+        session_id,
+        movement_type,
+        payment_method,
+        amount,
+        reason,
+        created_by
+    )
+    VALUES (
+        p_store_id,
+        p_session_id,
+        'SALE',
+        p_payment_method,
+        v_total_net,
+        'Venda ' || v_receipt_number,
+        v_user_id
+    );
+
+
+    IF p_payment_method = 'CASH' THEN
+
+        UPDATE public.cash_sessions
+        SET total_sales_cash =
+                total_sales_cash + v_total_net,
+            expected_cash =
+                expected_cash + v_total_net
+        WHERE id = p_session_id;
+
+    ELSIF p_payment_method IN ('CARD_CREDIT', 'CARD_DEBIT') THEN
+
+        UPDATE public.cash_sessions
+        SET total_sales_card =
+                total_sales_card + v_total_net
+        WHERE id = p_session_id;
+
+    ELSIF p_payment_method = 'PIX' THEN
+
+        UPDATE public.cash_sessions
+        SET total_sales_pix =
+                total_sales_pix + v_total_net
+        WHERE id = p_session_id;
+
+    ELSE
+
+        UPDATE public.cash_sessions
+        SET total_sales_other =
+                total_sales_other + v_total_net
+        WHERE id = p_session_id;
+
+    END IF;
+
+
+    -- ---------------------------------------------------------------
+    -- FINANCEIRO
+    -- ---------------------------------------------------------------
+
+    INSERT INTO public.financial_transactions (
+        store_id,
+        category,
+        transaction_type,
+        amount,
+        payment_method,
+        reference_id,
+        reference_type,
+        description,
+        transaction_date,
+        created_by
+    )
+    VALUES (
+        p_store_id,
+        'SALE_REVENUE',
+        'INCOME',
+        v_total_net,
+        p_payment_method,
+        v_sale_id,
+        'SALE',
+        'Receita de Venda ' || v_receipt_number,
+        CURRENT_DATE,
+        v_user_id
+    );
+
+
+    -- ---------------------------------------------------------------
+    -- AUDITORIA
+    -- ---------------------------------------------------------------
+
+    INSERT INTO public.audit_logs (
+        store_id,
+        user_id,
+        user_role,
+        user_email,
+        action,
+        entity,
+        entity_id,
+        details
+    )
+    SELECT
+        p_store_id,
+        v_user_id,
+        COALESCE(
+            (
+                SELECT su.role::TEXT
+                FROM public.store_users su
+                WHERE su.user_id = v_user_id
+                  AND su.store_id = p_store_id
+                  AND su.active = TRUE
+                LIMIT 1
+            ),
+            public.current_user_system_role()::TEXT
+        ),
+        (
+            SELECT p.email
+            FROM public.profiles p
+            WHERE p.id = v_user_id
+        ),
+        'SALE',
+        'sales',
+        v_sale_id,
+        'Venda ' ||
+        v_receipt_number ||
+        ' total ' ||
+        v_total_net ||
+        ' paga via ' ||
+        p_payment_method;
+
+
+    RETURN jsonb_build_object(
+        'success', TRUE,
+        'sale_id', v_sale_id,
+        'receipt_number', v_receipt_number,
+        'total_gross', v_total_gross,
+        'discount_amount', p_discount_amount,
+        'total_net', v_total_net,
+        'payment_method', p_payment_method
+    );
+
+END;
+$$;
+
+
+-- =====================================================================
+-- 34. PROTEGER REVERSE SALE
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION public.reverse_sale(
+    p_sale_id UUID,
+    p_reason TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_user_id UUID := auth.uid();
+    v_sale RECORD;
+    v_item RECORD;
+    v_current_stock NUMERIC(12,3);
+BEGIN
+
+    SELECT *
+    INTO v_sale
+    FROM public.sales
+    WHERE id = p_sale_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Venda não encontrada.';
+    END IF;
+
+
+    IF NOT public.current_user_is_store_manager(v_sale.store_id)
+       AND NOT public.current_user_is_super_admin() THEN
+
+        RAISE EXCEPTION
+            'Apenas administradores ou gestores desta farmácia podem estornar a venda.';
+    END IF;
+
+
+    IF v_sale.status = 'REVERSED' THEN
+        RAISE EXCEPTION 'Esta venda já foi estornada anteriormente.';
+    END IF;
+
+
+    FOR v_item IN
+        SELECT *
+        FROM public.sale_items
+        WHERE sale_id = p_sale_id
+    LOOP
+
+        IF v_item.batch_id IS NOT NULL THEN
+
+            UPDATE public.batches
+            SET current_quantity_base =
+                    current_quantity_base + v_item.quantity_base,
+                status = 'ACTIVE'
+            WHERE id = v_item.batch_id;
+
+        END IF;
+
+
+        SELECT current_stock_base
+        INTO v_current_stock
+        FROM public.products
+        WHERE id = v_item.product_id
+        FOR UPDATE;
+
+
+        UPDATE public.products
+        SET current_stock_base =
+                current_stock_base + v_item.quantity_base,
+            updated_at = NOW()
+        WHERE id = v_item.product_id;
+
+
+        INSERT INTO public.stock_movements (
+            store_id,
+            product_id,
+            batch_id,
+            movement_type,
+            quantity_base,
+            previous_stock_base,
+            new_stock_base,
+            unit_cost,
+            reference_id,
+            reference_type,
+            reason,
+            created_by
+        )
+        VALUES (
+            v_sale.store_id,
+            v_item.product_id,
+            v_item.batch_id,
+            'REVERSAL',
+            v_item.quantity_base,
+            v_current_stock,
+            v_current_stock + v_item.quantity_base,
+            v_item.unit_cogs,
+            v_sale.id,
+            'REVERSAL',
+            'Estorno de venda ' ||
+            v_sale.receipt_number ||
+            ': ' ||
+            COALESCE(
+                p_reason,
+                'Sem motivo especificado'
+            ),
+            v_user_id
+        );
+
+    END LOOP;
+
+
+    UPDATE public.sales
+    SET status = 'REVERSED',
+        reversed_at = NOW(),
+        reversed_by = v_user_id,
+        reversal_reason = p_reason
+    WHERE id = p_sale_id;
+
+
+    IF v_sale.session_id IS NOT NULL THEN
+
+        INSERT INTO public.cash_movements (
+            store_id,
+            session_id,
+            movement_type,
+            payment_method,
+            amount,
+            reason,
+            created_by
+        )
+        VALUES (
+            v_sale.store_id,
+            v_sale.session_id,
+            'REVERSAL',
+            v_sale.payment_method,
+            -v_sale.total_net,
+            'Estorno da venda ' || v_sale.receipt_number,
+            v_user_id
+        );
+
+
+        IF v_sale.payment_method = 'CASH' THEN
+
+            UPDATE public.cash_sessions
+            SET total_sales_cash =
+                    total_sales_cash - v_sale.total_net,
+                expected_cash =
+                    expected_cash - v_sale.total_net
+            WHERE id = v_sale.session_id;
+
+        ELSIF v_sale.payment_method IN (
+            'CARD_CREDIT',
+            'CARD_DEBIT'
+        ) THEN
+
+            UPDATE public.cash_sessions
+            SET total_sales_card =
+                    total_sales_card - v_sale.total_net
+            WHERE id = v_sale.session_id;
+
+        ELSIF v_sale.payment_method = 'PIX' THEN
+
+            UPDATE public.cash_sessions
+            SET total_sales_pix =
+                    total_sales_pix - v_sale.total_net
+            WHERE id = v_sale.session_id;
+
+        ELSE
+
+            UPDATE public.cash_sessions
+            SET total_sales_other =
+                    total_sales_other - v_sale.total_net
+            WHERE id = v_sale.session_id;
+
+        END IF;
+
+    END IF;
+
+
+    INSERT INTO public.financial_transactions (
+        store_id,
+        category,
+        transaction_type,
+        amount,
+        payment_method,
+        reference_id,
+        reference_type,
+        description,
+        transaction_date,
+        created_by
+    )
+    VALUES (
+        v_sale.store_id,
+        'SALE_REVERSAL',
+        'EXPENSE',
+        v_sale.total_net,
+        v_sale.payment_method,
+        v_sale.id,
+        'REVERSAL',
+        'Estorno de Receita - Venda ' ||
+            v_sale.receipt_number,
+        CURRENT_DATE,
+        v_user_id
+    );
+
+
+    INSERT INTO public.audit_logs (
+        store_id,
+        user_id,
+        action,
+        entity,
+        entity_id,
+        details
+    )
+    VALUES (
+        v_sale.store_id,
+        v_user_id,
+        'SALE_REVERSAL',
+        'sales',
+        v_sale.id,
+        'Estorno da venda ' ||
+        v_sale.receipt_number ||
+        '. Motivo: ' ||
+        COALESCE(p_reason, 'Nenhum')
+    );
+
+
+    RETURN jsonb_build_object(
+        'success', TRUE,
+        'sale_id', p_sale_id
+    );
+
+END;
+$$;
+
+
+-- =====================================================================
+-- 35. PROTEGER REGISTER PURCHASE
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION public.register_purchase_entry(
+    p_store_id UUID,
+    p_supplier_id UUID,
+    p_invoice_number VARCHAR(100),
+    p_purchase_date DATE,
+    p_notes TEXT,
+    p_items JSONB
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_user_id UUID := auth.uid();
+    v_purchase_id UUID;
+    v_total_amount NUMERIC(12,2) := 0;
+    v_item RECORD;
+    v_batch_id UUID;
+    v_qty_base NUMERIC(12,3);
+    v_cost_per_base NUMERIC(12,4);
+    v_item_total NUMERIC(12,2);
+    v_prev_stock NUMERIC(12,3);
+    v_new_stock NUMERIC(12,3);
+BEGIN
+
+    IF NOT public.current_user_is_store_manager(p_store_id) THEN
+        RAISE EXCEPTION
+            'Apenas ADMIN ou JUNIOR_MANAGER desta farmácia podem registrar compras.';
+    END IF;
+
+
+    IF p_items IS NULL OR jsonb_array_length(p_items) = 0 THEN
+        RAISE EXCEPTION 'A compra deve conter pelo menos um item.';
+    END IF;
+
+
+    IF p_supplier_id IS NOT NULL THEN
+
+        IF NOT EXISTS (
+            SELECT 1
+            FROM public.suppliers s
+            WHERE s.id = p_supplier_id
+              AND s.store_id = p_store_id
+              AND s.active = TRUE
+        ) THEN
+            RAISE EXCEPTION
+                'Fornecedor não pertence a esta farmácia.';
+        END IF;
+
+    END IF;
+
+
+    FOR v_item IN
+        SELECT *
+        FROM jsonb_to_recordset(p_items) AS x(
+            product_id UUID,
+            batch_number VARCHAR(100),
+            expiry_date DATE,
+            unit_id UUID,
+            quantity NUMERIC(12,3),
+            multiplier_to_base NUMERIC(12,3),
+            unit_cost NUMERIC(12,4),
+            sale_price_base NUMERIC(12,4)
+        )
+    LOOP
+
+        IF NOT EXISTS (
+            SELECT 1
+            FROM public.products p
+            WHERE p.id = v_item.product_id
+              AND p.store_id = p_store_id
+              AND p.active = TRUE
+        ) THEN
+            RAISE EXCEPTION
+                'Produto não pertence a esta farmácia.';
+        END IF;
+
+
+        IF v_item.quantity IS NULL
+           OR v_item.quantity <= 0 THEN
+            RAISE EXCEPTION
+                'Quantidade de compra inválida.';
+        END IF;
+
+
+        IF v_item.unit_cost IS NULL
+           OR v_item.unit_cost < 0 THEN
+            RAISE EXCEPTION
+                'Custo de compra inválido.';
+        END IF;
+
+
+        IF v_item.expiry_date IS NULL THEN
+            RAISE EXCEPTION
+                'A validade do lote é obrigatória.';
+        END IF;
+
+
+        v_item_total :=
+            ROUND(
+                (
+                    v_item.quantity *
+                    v_item.unit_cost
+                )::NUMERIC,
+                2
+            );
+
+        v_total_amount :=
+            v_total_amount + v_item_total;
+
+    END LOOP;
+
+
+    INSERT INTO public.purchases (
+        store_id,
+        supplier_id,
+        invoice_number,
+        purchase_date,
+        total_amount,
+        payment_status,
+        notes,
+        created_by
+    )
+    VALUES (
+        p_store_id,
+        p_supplier_id,
+        p_invoice_number,
+        COALESCE(
+            p_purchase_date,
+            CURRENT_DATE
+        ),
+        v_total_amount,
+        'PAID',
+        p_notes,
+        v_user_id
+    )
+    RETURNING id INTO v_purchase_id;
+
+
+    FOR v_item IN
+        SELECT *
+        FROM jsonb_to_recordset(p_items) AS x(
+            product_id UUID,
+            batch_number VARCHAR(100),
+            expiry_date DATE,
+            unit_id UUID,
+            quantity NUMERIC(12,3),
+            multiplier_to_base NUMERIC(12,3),
+            unit_cost NUMERIC(12,4),
+            sale_price_base NUMERIC(12,4)
+        )
+    LOOP
+
+        v_qty_base :=
+            v_item.quantity *
+            COALESCE(
+                v_item.multiplier_to_base,
+                1
+            );
+
+        v_cost_per_base :=
+            v_item.unit_cost /
+            COALESCE(
+                v_item.multiplier_to_base,
+                1
+            );
+
+        v_item_total :=
+            ROUND(
+                (
+                    v_item.quantity *
+                    v_item.unit_cost
+                )::NUMERIC,
+                2
+            );
+
+
+        INSERT INTO public.purchase_items (
+            purchase_id,
+            product_id,
+            batch_number,
+            expiry_date,
+            unit_id,
+            quantity,
+            multiplier_to_base,
+            quantity_base,
+            unit_cost,
+            total_cost,
+            sale_price_per_base
+        )
+        VALUES (
+            v_purchase_id,
+            v_item.product_id,
+            v_item.batch_number,
+            v_item.expiry_date,
+            v_item.unit_id,
+            v_item.quantity,
+            COALESCE(
+                v_item.multiplier_to_base,
+                1
+            ),
+            v_qty_base,
+            v_item.unit_cost,
+            v_item_total,
+            v_item.sale_price_base
+        );
+
+
+        INSERT INTO public.batches (
+            store_id,
+            product_id,
+            batch_number,
+            supplier_id,
+            initial_quantity_base,
+            current_quantity_base,
+            cost_per_base,
+            expiry_date,
+            status
+        )
+        VALUES (
+            p_store_id,
+            v_item.product_id,
+            v_item.batch_number,
+            p_supplier_id,
+            v_qty_base,
+            v_qty_base,
+            v_cost_per_base,
+            v_item.expiry_date,
+            'ACTIVE'
+        )
+        RETURNING id INTO v_batch_id;
+
+
+        SELECT current_stock_base
+        INTO v_prev_stock
+        FROM public.products
+        WHERE id = v_item.product_id
+          AND store_id = p_store_id
+        FOR UPDATE;
+
+
+        v_new_stock :=
+            v_prev_stock + v_qty_base;
+
+
+        UPDATE public.products
+        SET current_stock_base = v_new_stock,
+            cost_price_base = v_cost_per_base,
+            sale_price_base =
+                COALESCE(
+                    v_item.sale_price_base,
+                    sale_price_base
+                ),
+            updated_at = NOW()
+        WHERE id = v_item.product_id
+          AND store_id = p_store_id;
+
+
+        INSERT INTO public.stock_movements (
+            store_id,
+            product_id,
+            batch_id,
+            movement_type,
+            quantity_base,
+            previous_stock_base,
+            new_stock_base,
+            unit_cost,
+            reference_id,
+            reference_type,
+            reason,
+            created_by
+        )
+        VALUES (
+            p_store_id,
+            v_item.product_id,
+            v_batch_id,
+            'ENTRY',
+            v_qty_base,
+            v_prev_stock,
+            v_new_stock,
+            v_cost_per_base,
+            v_purchase_id,
+            'PURCHASE',
+            'Entrada NF ' ||
+            COALESCE(
+                p_invoice_number,
+                'S/N'
+            ) ||
+            ' Lote: ' ||
+            v_item.batch_number,
+            v_user_id
+        );
+
+    END LOOP;
+
+
+    INSERT INTO public.financial_transactions (
+        store_id,
+        category,
+        transaction_type,
+        amount,
+        payment_method,
+        reference_id,
+        reference_type,
+        description,
+        transaction_date,
+        created_by
+    )
+    VALUES (
+        p_store_id,
+        'PURCHASE_EXPENSE',
+        'EXPENSE',
+        v_total_amount,
+        'TRANSFER',
+        v_purchase_id,
+        'PURCHASE',
+        'Compra NF ' ||
+        COALESCE(
+            p_invoice_number,
+            'S/N'
+        ),
+        COALESCE(
+            p_purchase_date,
+            CURRENT_DATE
+        ),
+        v_user_id
+    );
+
+
+    INSERT INTO public.audit_logs (
+        store_id,
+        user_id,
+        action,
+        entity,
+        entity_id,
+        details
+    )
+    VALUES (
+        p_store_id,
+        v_user_id,
+        'PURCHASE_ENTRY',
+        'purchases',
+        v_purchase_id,
+        'Entrada de mercadorias NF: ' ||
+        COALESCE(
+            p_invoice_number,
+            'S/N'
+        ) ||
+        ' total ' ||
+        v_total_amount
+    );
+
+
+    RETURN jsonb_build_object(
+        'success', TRUE,
+        'purchase_id', v_purchase_id,
+        'total_amount', v_total_amount
+    );
+
+END;
+$$;
+
+
+-- =====================================================================
+-- 36. PROTEGER REGISTER LOSS
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION public.register_loss(
+    p_store_id UUID,
+    p_product_id UUID,
+    p_batch_id UUID,
+    p_quantity_base NUMERIC(12,3),
+    p_loss_type loss_reason_type,
+    p_reason TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_user_id UUID := auth.uid();
+    v_batch RECORD;
+    v_prod RECORD;
+    v_total_cost NUMERIC(12,2);
+    v_prev_stock NUMERIC(12,3);
+    v_new_stock NUMERIC(12,3);
+    v_loss_id UUID;
+BEGIN
+
+    IF NOT public.current_user_is_store_manager(p_store_id) THEN
+        RAISE EXCEPTION
+            'Apenas ADMIN ou JUNIOR_MANAGER podem registrar perdas.';
+    END IF;
+
+
+    IF p_quantity_base IS NULL
+       OR p_quantity_base <= 0 THEN
+        RAISE EXCEPTION
+            'Quantidade de perda inválida.';
+    END IF;
+
+
+    SELECT *
+    INTO v_batch
+    FROM public.batches
+    WHERE id = p_batch_id
+      AND store_id = p_store_id
+      AND product_id = p_product_id
+    FOR UPDATE;
+
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Lote não encontrado nesta farmácia/produto.';
+    END IF;
+
+
+    IF v_batch.current_quantity_base < p_quantity_base THEN
+        RAISE EXCEPTION
+            'Quantidade de perda maior que a disponível no lote. Disponível: %',
+            v_batch.current_quantity_base;
+    END IF;
+
+
+    v_total_cost :=
+        ROUND(
+            (
+                p_quantity_base *
+                v_batch.cost_per_base
+            )::NUMERIC,
+            2
+        );
+
+
+    UPDATE public.batches
+    SET current_quantity_base =
+            current_quantity_base - p_quantity_base,
+        status =
+            CASE
+                WHEN current_quantity_base - p_quantity_base = 0
+                THEN 'EXHAUSTED'
+                ELSE status
+            END
+    WHERE id = p_batch_id;
+
+
+    SELECT *
+    INTO v_prod
+    FROM public.products
+    WHERE id = p_product_id
+      AND store_id = p_store_id
+    FOR UPDATE;
+
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Produto não encontrado nesta farmácia.';
+    END IF;
+
+
+    IF v_prod.current_stock_base < p_quantity_base THEN
+        RAISE EXCEPTION
+            'Estoque geral insuficiente para registrar esta perda.';
+    END IF;
+
+
+    v_prev_stock :=
+        v_prod.current_stock_base;
+
+    v_new_stock :=
+        v_prev_stock - p_quantity_base;
+
+
+    UPDATE public.products
+    SET current_stock_base = v_new_stock,
+        updated_at = NOW()
+    WHERE id = p_product_id
+      AND store_id = p_store_id;
+
+
+    INSERT INTO public.losses (
+        store_id,
+        product_id,
+        batch_id,
+        quantity_base,
+        unit_cost,
+        total_cost,
+        loss_type,
+        reason,
+        recorded_by
+    )
+    VALUES (
+        p_store_id,
+        p_product_id,
+        p_batch_id,
+        p_quantity_base,
+        v_batch.cost_per_base,
+        v_total_cost,
+        p_loss_type,
+        p_reason,
+        v_user_id
+    )
+    RETURNING id INTO v_loss_id;
+
+
+    INSERT INTO public.stock_movements (
+        store_id,
+        product_id,
+        batch_id,
+        movement_type,
+        quantity_base,
+        previous_stock_base,
+        new_stock_base,
+        unit_cost,
+        reference_id,
+        reference_type,
+        reason,
+        created_by
+    )
+    VALUES (
+        p_store_id,
+        p_product_id,
+        p_batch_id,
+        'LOSS',
+        -p_quantity_base,
+        v_prev_stock,
+        v_new_stock,
+        v_batch.cost_per_base,
+        v_loss_id,
+        'LOSS',
+        'Registro de perda/descarte: ' ||
+        p_reason,
+        v_user_id
+    );
+
+
+    INSERT INTO public.financial_transactions (
+        store_id,
+        category,
+        transaction_type,
+        amount,
+        payment_method,
+        reference_id,
+        reference_type,
+        description,
+        transaction_date,
+        created_by
+    )
+    VALUES (
+        p_store_id,
+        'LOSS_EXPENSE',
+        'EXPENSE',
+        v_total_cost,
+        'OTHER',
+        v_loss_id,
+        'LOSS',
+        'Perda de estoque: ' ||
+        p_reason,
+        CURRENT_DATE,
+        v_user_id
+    );
+
+
+    INSERT INTO public.audit_logs (
+        store_id,
+        user_id,
+        action,
+        entity,
+        entity_id,
+        details
+    )
+    VALUES (
+        p_store_id,
+        v_user_id,
+        'LOSS_RECORDED',
+        'losses',
+        v_loss_id,
+        'Perda registrada no lote ' ||
+        v_batch.batch_number ||
+        ' no valor de ' ||
+        v_total_cost
+    );
+
+
+    RETURN jsonb_build_object(
+        'success', TRUE,
+        'loss_id', v_loss_id
+    );
+
+END;
+$$;
+
+
+-- =====================================================================
+-- 37. PROTEGER SANGRIA
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION public.register_sangria(
+    p_store_id UUID,
+    p_session_id UUID,
+    p_amount NUMERIC(12,2),
+    p_destination VARCHAR(255),
+    p_reason TEXT,
+    p_notes TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_user_id UUID := auth.uid();
+    v_session RECORD;
+    v_mov_id UUID;
+BEGIN
+
+    IF NOT public.current_user_can_operate_cash(p_store_id) THEN
+        RAISE EXCEPTION
+            'Utilizador sem permissão para operar o caixa desta farmácia.';
+    END IF;
+
+
+    SELECT *
+    INTO v_session
+    FROM public.cash_sessions
+    WHERE id = p_session_id
+      AND store_id = p_store_id
+    FOR UPDATE;
+
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Sessão de caixa não encontrada.';
+    END IF;
+
+
+    IF v_session.status <> 'OPEN' THEN
+        RAISE EXCEPTION
+            'A sessão de caixa está fechada.';
+    END IF;
+
+
+    IF public.current_user_system_role()
+       NOT IN ('SUPER_ADMIN', 'UNIVERSAL_CASHIER')
+       AND NOT public.current_user_is_store_manager(p_store_id)
+       AND v_session.user_id <> v_user_id THEN
+
+        RAISE EXCEPTION
+            'Esta sessão pertence a outro utilizador.';
+    END IF;
+
+
+    IF p_amount IS NULL OR p_amount <= 0 THEN
+        RAISE EXCEPTION
+            'O valor da sangria deve ser maior que zero.';
+    END IF;
+
+
+    IF p_destination NOT IN (
+        'SANGRIA_BANK',
+        'SANGRIA_OWNER'
+    ) THEN
+        RAISE EXCEPTION
+            'Destino de sangria inválido.';
+    END IF;
+
+
+    IF p_amount > v_session.expected_cash THEN
+        RAISE EXCEPTION
+            'Valor da sangria superior ao dinheiro esperado no caixa.';
+    END IF;
+
+
+    INSERT INTO public.cash_movements (
+        store_id,
+        session_id,
+        movement_type,
+        payment_method,
+        amount,
+        reason,
+        destination,
+        notes,
+        created_by
+    )
+    VALUES (
+        p_store_id,
+        p_session_id,
+        p_destination::public.cash_movement_type,
+        'CASH',
+        p_amount,
+        p_reason,
+        p_destination,
+        p_notes,
+        v_user_id
+    )
+    RETURNING id INTO v_mov_id;
+
+
+    UPDATE public.cash_sessions
+    SET total_sangrias =
+            total_sangrias + p_amount,
+        expected_cash =
+            expected_cash - p_amount
+    WHERE id = p_session_id;
+
+
+    IF p_destination = 'SANGRIA_OWNER' THEN
+
+        INSERT INTO public.capital_transactions (
+            store_id,
+            transaction_type,
+            amount,
+            description,
+            payment_method,
+            reference_date,
+            created_by
+        )
+        VALUES (
+            p_store_id,
+            'OWNER_WITHDRAWAL',
+            p_amount,
+            'Retirada de Sangria do Caixa: ' ||
+                p_reason,
+            'CASH',
+            CURRENT_DATE,
+            v_user_id
+        );
+
+
+        INSERT INTO public.financial_transactions (
+            store_id,
+            category,
+            transaction_type,
+            amount,
+            payment_method,
+            reference_id,
+            reference_type,
+            description,
+            transaction_date,
+            created_by
+        )
+        VALUES (
+            p_store_id,
+            'OWNER_WITHDRAWAL',
+            'EXPENSE',
+            p_amount,
+            'CASH',
+            v_mov_id,
+            'SANGRIA',
+            'Retirada do Proprietário: ' ||
+                p_reason,
+            CURRENT_DATE,
+            v_user_id
+        );
+
+    END IF;
+
+
+    INSERT INTO public.audit_logs (
+        store_id,
+        user_id,
+        action,
+        entity,
+        entity_id,
+        details
+    )
+    VALUES (
+        p_store_id,
+        v_user_id,
+        'SANGRIA',
+        'cash_movements',
+        v_mov_id,
+        'Sangria de ' ||
+        p_amount ||
+        ' (' ||
+        p_destination ||
+        '). Motivo: ' ||
+        p_reason
+    );
+
+
+    RETURN jsonb_build_object(
+        'success', TRUE,
+        'movement_id', v_mov_id
+    );
+
+END;
+$$;
+
+
+-- =====================================================================
+-- 38. PROTEGER FECHAMENTO DE CAIXA
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION public.close_cash_session(
+    p_session_id UUID,
+    p_counted_cash NUMERIC(12,2),
+    p_notes TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_user_id UUID := auth.uid();
+    v_session RECORD;
+    v_difference NUMERIC(12,2);
+BEGIN
+
+    SELECT *
+    INTO v_session
+    FROM public.cash_sessions
+    WHERE id = p_session_id
+    FOR UPDATE;
+
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Sessão de caixa não encontrada.';
+    END IF;
+
+
+    IF NOT public.current_user_has_store_access(v_session.store_id) THEN
+        RAISE EXCEPTION
+            'Utilizador sem acesso a esta farmácia.';
+    END IF;
+
+
+    IF v_session.status = 'CLOSED' THEN
+        RAISE EXCEPTION
+            'Esta sessão de caixa já está fechada.';
+    END IF;
+
+
+    IF public.current_user_system_role()
+       NOT IN ('SUPER_ADMIN', 'UNIVERSAL_CASHIER')
+       AND NOT public.current_user_is_store_manager(v_session.store_id)
+       AND v_session.user_id <> v_user_id THEN
+
+        RAISE EXCEPTION
+            'Esta sessão pertence a outro utilizador.';
+    END IF;
+
+
+    IF p_counted_cash IS NULL
+       OR p_counted_cash < 0 THEN
+        RAISE EXCEPTION
+            'Valor contado inválido.';
+    END IF;
+
+
+    v_difference :=
+        p_counted_cash -
+        v_session.expected_cash;
+
+
+    UPDATE public.cash_sessions
+    SET closed_at = NOW(),
+        counted_cash = p_counted_cash,
+        cash_difference = v_difference,
+        status = 'CLOSED',
+        notes = p_notes
+    WHERE id = p_session_id;
+
+
+    INSERT INTO public.audit_logs (
+        store_id,
+        user_id,
+        action,
+        entity,
+        entity_id,
+        details
+    )
+    VALUES (
+        v_session.store_id,
+        v_user_id,
+        'CASH_CLOSE',
+        'cash_sessions',
+        p_session_id,
+        'Fechamento de caixa. Esperado: ' ||
+        v_session.expected_cash ||
+        ', Contado: ' ||
+        p_counted_cash ||
+        ', Diferença: ' ||
+        v_difference
+    );
+
+
+    RETURN jsonb_build_object(
+        'success', TRUE,
+        'expected_cash', v_session.expected_cash,
+        'counted_cash', p_counted_cash,
+        'difference', v_difference
+    );
+
+END;
+$$;
+
+
+-- =====================================================================
+-- 39. ADMIN DASHBOARD
+--
+-- ADMIN local pode ver a sua farmácia.
+-- SUPER_ADMIN pode ver qualquer farmácia.
+-- UNIVERSAL_CASHIER NÃO recebe dashboard administrativo.
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION public.get_admin_dashboard_metrics(
+    p_store_id UUID
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_today DATE := CURRENT_DATE;
+    v_today_sales_revenue NUMERIC(12,2) := 0;
+    v_today_cogs NUMERIC(12,2) := 0;
+    v_today_profit NUMERIC(12,2) := 0;
+    v_today_sales_count INT := 0;
+    v_month_sales_revenue NUMERIC(12,2) := 0;
+    v_month_cogs NUMERIC(12,2) := 0;
+    v_month_profit NUMERIC(12,2) := 0;
+    v_stock_cost_valuation NUMERIC(12,2) := 0;
+    v_stock_sale_valuation NUMERIC(12,2) := 0;
+    v_total_capital_contributions NUMERIC(12,2) := 0;
+    v_total_capital_withdrawals NUMERIC(12,2) := 0;
+    v_net_invested_capital NUMERIC(12,2) := 0;
+    v_cash_in_open_drawers NUMERIC(12,2) := 0;
+    v_total_losses_month NUMERIC(12,2) := 0;
+    v_expired_batches_count INT := 0;
+    v_expiring_30_count INT := 0;
+    v_expiring_60_count INT := 0;
+    v_expiring_90_count INT := 0;
+BEGIN
+
+    IF NOT public.current_user_is_store_admin(p_store_id) THEN
+        RAISE EXCEPTION
+            'Acesso restrito ao administrador desta farmácia.';
+    END IF;
+
+
+    SELECT
+        COALESCE(SUM(total_net), 0),
+        COALESCE(SUM(total_cogs), 0),
+        COALESCE(SUM(gross_profit), 0),
+        COUNT(*)
+    INTO
+        v_today_sales_revenue,
+        v_today_cogs,
+        v_today_profit,
+        v_today_sales_count
+    FROM public.sales
+    WHERE store_id = p_store_id
+      AND status = 'COMPLETED'
+      AND created_at >= v_today::TIMESTAMPTZ;
+
+
+    SELECT
+        COALESCE(SUM(total_net), 0),
+        COALESCE(SUM(total_cogs), 0),
+        COALESCE(SUM(gross_profit), 0)
+    INTO
+        v_month_sales_revenue,
+        v_month_cogs,
+        v_month_profit
+    FROM public.sales
+    WHERE store_id = p_store_id
+      AND status = 'COMPLETED'
+      AND created_at >=
+          DATE_TRUNC(
+              'month',
+              v_today
+          )::TIMESTAMPTZ;
+
+
+    SELECT
+        COALESCE(
+            SUM(
+                b.current_quantity_base *
+                b.cost_per_base
+            ),
+            0
+        )
+    INTO v_stock_cost_valuation
+    FROM public.batches b
+    WHERE b.store_id = p_store_id
+      AND b.current_quantity_base > 0;
+
+
+    SELECT
+        COALESCE(
+            SUM(
+                p.current_stock_base *
+                p.sale_price_base
+            ),
+            0
+        )
+    INTO v_stock_sale_valuation
+    FROM public.products p
+    WHERE p.store_id = p_store_id
+      AND p.current_stock_base > 0;
+
+
+    SELECT
+        COALESCE(
+            SUM(
+                CASE
+                    WHEN transaction_type IN (
+                        'INITIAL_CAPITAL',
+                        'CAPITAL_CONTRIBUTION'
+                    )
+                    THEN amount
+                    ELSE 0
+                END
+            ),
+            0
+        ),
+        COALESCE(
+            SUM(
+                CASE
+                    WHEN transaction_type =
+                        'OWNER_WITHDRAWAL'
+                    THEN amount
+                    ELSE 0
+                END
+            ),
+            0
+        )
+    INTO
+        v_total_capital_contributions,
+        v_total_capital_withdrawals
+    FROM public.capital_transactions
+    WHERE store_id = p_store_id;
+
+
+    v_net_invested_capital :=
+        v_total_capital_contributions -
+        v_total_capital_withdrawals;
+
+
+    SELECT
+        COALESCE(
+            SUM(expected_cash),
+            0
+        )
+    INTO v_cash_in_open_drawers
+    FROM public.cash_sessions
+    WHERE store_id = p_store_id
+      AND status = 'OPEN';
+
+
+    SELECT
+        COALESCE(
+            SUM(total_cost),
+            0
+        )
+    INTO v_total_losses_month
+    FROM public.losses
+    WHERE store_id = p_store_id
+      AND created_at >=
+          DATE_TRUNC(
+              'month',
+              v_today
+          )::TIMESTAMPTZ;
+
+
+    SELECT
+        COUNT(
+            CASE
+                WHEN expiry_date < v_today
+                THEN 1
+            END
+        ),
+        COUNT(
+            CASE
+                WHEN expiry_date >= v_today
+                 AND expiry_date <=
+                     v_today + INTERVAL '30 days'
+                THEN 1
+            END
+        ),
+        COUNT(
+            CASE
+                WHEN expiry_date >
+                     v_today + INTERVAL '30 days'
+                 AND expiry_date <=
+                     v_today + INTERVAL '60 days'
+                THEN 1
+            END
+        ),
+        COUNT(
+            CASE
+                WHEN expiry_date >
+                     v_today + INTERVAL '60 days'
+                 AND expiry_date <=
+                     v_today + INTERVAL '90 days'
+                THEN 1
+            END
+        )
+    INTO
+        v_expired_batches_count,
+        v_expiring_30_count,
+        v_expiring_60_count,
+        v_expiring_90_count
+    FROM public.batches
+    WHERE store_id = p_store_id
+      AND current_quantity_base > 0;
+
+
+    RETURN jsonb_build_object(
+        'today_sales_revenue',
+        v_today_sales_revenue,
+
+        'today_cogs',
+        v_today_cogs,
+
+        'today_profit',
+        v_today_profit,
+
+        'today_sales_count',
+        v_today_sales_count,
+
+        'month_sales_revenue',
+        v_month_sales_revenue,
+
+        'month_cogs',
+        v_month_cogs,
+
+        'month_profit',
+        v_month_profit,
+
+        'stock_cost_valuation',
+        v_stock_cost_valuation,
+
+        'stock_sale_valuation',
+        v_stock_sale_valuation,
+
+        'net_invested_capital',
+        v_net_invested_capital,
+
+        'cash_in_open_drawers',
+        v_cash_in_open_drawers,
+
+        'estimated_patrimony',
+        v_cash_in_open_drawers +
+        v_stock_cost_valuation,
+
+        'total_losses_month',
+        v_total_losses_month,
+
+        'expired_batches_count',
+        v_expired_batches_count,
+
+        'expiring_30_count',
+        v_expiring_30_count,
+
+        'expiring_60_count',
+        v_expiring_60_count,
+
+        'expiring_90_count',
+        v_expiring_90_count
+    );
+
+END;
+$$;
+
+
+-- =====================================================================
+-- 40. CASHIER DASHBOARD
+--
+-- CASHIER normal:
+--   somente a própria farmácia/sessão.
+--
+-- UNIVERSAL_CASHIER:
+--   pode consultar qualquer farmácia.
+--
+-- SUPER_ADMIN:
+--   pode consultar qualquer farmácia.
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION public.get_cashier_dashboard_metrics(
+    p_store_id UUID,
+    p_session_id UUID
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_user_id UUID := auth.uid();
+    v_session RECORD;
+    v_today_sales_count INT := 0;
+    v_today_sales_amount NUMERIC(12,2) := 0;
+    v_recent_sales JSONB;
+BEGIN
+
+    SELECT *
+    INTO v_session
+    FROM public.cash_sessions
+    WHERE id = p_session_id
+      AND store_id = p_store_id;
+
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION
+            'Sessão de caixa não encontrada.';
+    END IF;
+
+
+    IF NOT public.current_user_can_operate_cash(p_store_id) THEN
+        RAISE EXCEPTION
+            'Utilizador sem permissão para este caixa.';
+    END IF;
+
+
+    IF public.current_user_system_role()
+       NOT IN ('SUPER_ADMIN', 'UNIVERSAL_CASHIER')
+       AND NOT public.current_user_is_store_manager(p_store_id)
+       AND v_session.user_id <> v_user_id THEN
+
+        RAISE EXCEPTION
+            'Esta sessão pertence a outro utilizador.';
+    END IF;
+
+
+    SELECT
+        COUNT(*),
+        COALESCE(
+            SUM(total_net),
+            0
+        )
+    INTO
+        v_today_sales_count,
+        v_today_sales_amount
+    FROM public.sales
+    WHERE session_id = p_session_id
+      AND status = 'COMPLETED';
+
+
+    SELECT jsonb_agg(sub)
+    INTO v_recent_sales
+    FROM (
+        SELECT
+            id,
+            receipt_number,
+            total_net,
+            payment_method,
+            customer_name,
+            created_at
+        FROM public.sales
+        WHERE session_id = p_session_id
+        ORDER BY created_at DESC
+        LIMIT 10
+    ) sub;
+
+
+    RETURN jsonb_build_object(
+        'session_id',
+        v_session.id,
+
+        'status',
+        v_session.status,
+
+        'opened_at',
+        v_session.opened_at,
+
+        'initial_cash',
+        COALESCE(
+            v_session.initial_cash,
+            0
+        ),
+
+        'expected_cash',
+        COALESCE(
+            v_session.expected_cash,
+            0
+        ),
+
+        'total_sales_cash',
+        COALESCE(
+            v_session.total_sales_cash,
+            0
+        ),
+
+        'total_sales_card',
+        COALESCE(
+            v_session.total_sales_card,
+            0
+        ),
+
+        'total_sales_pix',
+        COALESCE(
+            v_session.total_sales_pix,
+            0
+        ),
+
+        'total_sangrias',
+        COALESCE(
+            v_session.total_sangrias,
+            0
+        ),
+
+        'session_sales_count',
+        v_today_sales_count,
+
+        'session_sales_amount',
+        v_today_sales_amount,
+
+        'recent_sales',
+        COALESCE(
+            v_recent_sales,
+            '[]'::JSONB
+        )
+    );
+
+END;
+$$;
+
+
+-- =====================================================================
+-- 41. ÍNDICES PARA A NOVA CAMADA DE AUTORIZAÇÃO
+-- =====================================================================
+
+CREATE INDEX IF NOT EXISTS idx_store_users_user_active
+ON public.store_users(user_id, active);
+
+CREATE INDEX IF NOT EXISTS idx_store_users_store_role_active
+ON public.store_users(store_id, role, active);
+
+CREATE INDEX IF NOT EXISTS idx_profiles_system_role_active
+ON public.profiles(system_role, active);
+
+
+-- =====================================================================
+-- 42. GARANTIR RLS ATIVA
+-- =====================================================================
+
+ALTER TABLE public.stores ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.store_users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.product_units ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.suppliers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.product_packages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.batches ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.purchases ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.purchase_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.stock_movements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.transfers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.transfer_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.cash_registers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.cash_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.cash_movements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sales ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sale_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.losses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.capital_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.financial_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.daily_closings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.settings ENABLE ROW LEVEL SECURITY;
+
+
+-- =====================================================================
+-- FIM DA MIGRAÇÃO
+-- =====================================================================
