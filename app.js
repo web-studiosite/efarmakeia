@@ -179,30 +179,8 @@ export const app = {
       }
     });
 
-    setupLink?.addEventListener('click', (e) => {
-      e.preventDefault();
-      import('./settings.js').then(m => {
-        import('./modal.js').then(mod => {
-          mod.modal.open({
-            title: isPt ? 'Configurar Credenciais do Supabase' : 'Configure Supabase Credentials',
-            contentHtml: `
-              <p style="color: var(--text-muted); margin-bottom: 1rem;">
-                ${isPt ? 'Insira a URL e a Chave Anônima do seu projeto Supabase:' : 'Enter your Supabase Project URL and Anon Public Key:'}
-              </p>
-              <div class="form-group">
-                <label class="form-label">Supabase URL</label>
-                <input type="text" id="m-supabase-url" class="form-control" value="${config.getSupabaseUrl()}" placeholder="https://xxx.supabase.co" />
-              </div>
-              <div class="form-group">
-                <label class="form-label">Supabase Anon Public Key</label>
-                <input type="password" id="m-supabase-key" class="form-control" value="${config.getSupabaseAnonKey()}" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." />
-              </div>
-            `,
-            footerHtml: `
-              <button class="btn btn-secondary" onclick="this.closest('.modal-overlay')?.remove()">${t('cancel')}</button>
-              <button class="btn btn-primary" id="btn-save-m-sup">${t('save')}</button>
-            `
-          });
+  
+    
 
           document.getElementById('btn-save-m-sup')?.addEventListener('click', () => {
             const u = document.getElementById('m-supabase-url')?.value.trim() || '';
